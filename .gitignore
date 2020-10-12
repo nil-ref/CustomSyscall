@@ -19,3 +19,4 @@
 *.cer
 *.ilk
 *.idb
+exe/x64/Release/exe.vcxproj.FileListAbsolute.txt

@@ -5,7 +5,7 @@ public sysp
 
 sysp PROC
 	mov	r10, rcx
-	mov eax, 2000h
+	mov eax, 321h
 	syscall
 	ret
 sysp ENDP
