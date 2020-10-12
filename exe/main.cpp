@@ -1,10 +1,10 @@
 #include <Windows.h>
-#include <stdio.h>
-#include <intrin.h>
-#include "..\CustomSyscall\shared.h"
+#include <winternl.h>
 #include <cstdio>
 #include <string>
-#include <errno.h>
+#include "..\CustomSyscall\shared.h"
+
+#pragma comment( lib, "ntdll.lib" )
 
 extern "C" LONG sysp( void );
 
@@ -21,7 +21,7 @@ void print_help( const char* name )
 
 std::string perr( LONG errn = 0 )
 {
-    DWORD errorMessageID = errn ? errn : GetLastError();
+    DWORD errorMessageID = errn ? RtlNtStatusToDosError( errn ) : GetLastError();
     if ( errorMessageID == 0 ) {
         return std::string( "STATUS_SUCCESS" );
     }
@@ -68,6 +68,7 @@ int install( void )
 
         CloseServiceHandle( hSCManager );
         CloseServiceHandle( hService );
+        printf( "[+] Success\n" );
         return ERROR_SUCCESS;
 
     }
@@ -96,6 +97,7 @@ int uninstall( void )
         DeleteService( hService );
         CloseServiceHandle( hSCManager );
         CloseServiceHandle( hService );
+        printf( "[+] Success\n" );
         return ERROR_SUCCESS;
     }
 

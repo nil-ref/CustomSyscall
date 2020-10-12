@@ -2,22 +2,13 @@
 #include <intrin.h>
 #include "shared.h"
 
-#define SSDT_OFFSET( base, func ) ( (ULONG)(((uintptr_t)func - (uintptr_t)base) << 4 ) )
-
-extern "C" {
-    NTKERNELAPI bool NTAPI KeAddSystemServiceTable( PULONG Base, PULONG Count, ULONG Limit, PUCHAR Number, ULONG Index );
-    NTKERNELAPI bool NTAPI KeRemoveSystemServiceTable( unsigned int Index );
-    NTKERNELAPI ULONG PsGetProcessSessionId( PEPROCESS Process );
-    NTKERNELAPI ULONG PsGetProcessSessionIdEx( PEPROCESS Process );
-    }
+#define SSDT_OFFSET( base, func ) ( (LONG)(((uintptr_t)func - (uintptr_t)base) << 4 ) )
 
 extern NTKERNELAPI PEPROCESS PsInitialSystemProcess;
 
 
 
-
-
-typedef ULONG SYSTEM_SERVICE_TABLE, *PSYSTEM_SERVICE_TABLE;
+typedef LONG SYSTEM_SERVICE_TABLE, *PSYSTEM_SERVICE_TABLE;
 typedef struct _KSERVICE_DESCRIPTOR_TABLE {
     PSYSTEM_SERVICE_TABLE ServiceTableBase;             // pointer to the base of the SSDT
     PSYSTEM_SERVICE_TABLE ServiceCounterTableBase;      // ???
@@ -25,19 +16,25 @@ typedef struct _KSERVICE_DESCRIPTOR_TABLE {
     PUCHAR ParamTableBase;                              // table for number of bytes arguments take on the stack -- TODO
 } KSERVICE_DESCRIPTOR_TABLE, *PKSERVICE_DESCRIPTOR_TABLE;
 
-SYSTEM_SERVICE_TABLE ServiceTableBase[1];
-UCHAR ParamTableBase[1];
 
+//
+// Saved Globals
+//
+ULONG origNumberOfServices;
+UCHAR origTrampolineBytes[12];
+PUCHAR trampoline;
+PKSERVICE_DESCRIPTOR_TABLE ssdt;
 
 //
 //
 //
 VOID DriverUnload( PDRIVER_OBJECT DriverObject )
 {
-    KdPrint( ( "=== %s: Goodbye World!\n", __FUNCTION__ ) );
-    UNICODE_STRING dosDeviceName = RTL_CONSTANT_STRING( DOS_DEVICE_NAME );
-    IoDeleteSymbolicLink( &dosDeviceName );
+    ssdt->NumberOfServices = origNumberOfServices;
+    RtlCopyMemory( trampoline, origTrampolineBytes, 12 );
     IoDeleteDevice( DriverObject->DeviceObject );
+
+    KdPrint(( "-- [!] -- CustomSyscall Unloaded\n" ));
 }
 
 
@@ -61,55 +58,26 @@ NTSTATUS IrpDefaultHandler( PDEVICE_OBJECT DeviceObject, PIRP Irp )
 //
 NTSTATUS MyCustomSyscall( VOID )
 {
-    DbgPrint( "Hello World!\n" );
+    KdPrint(( "-- [!] -- Hello from %s!\n", __FUNCTION__ ));
     return STATUS_SUCCESS;
 }
 
-
-#if 0
-TOOD: REMOVE ME
 //
 //
 //
-NTSTATUS InstallSyscall( VOID )
+PUCHAR findTrampoline( VOID )
 {
-    PUCHAR pStartAddress = (PUCHAR)__readmsr( 0xC0000082 ); // MSR's kernel's RIP SYSCALL entry for 64 bit
-    KdPrint( ( "=== pStart: %p\n", pStartAddress ) );
+    PUCHAR addr = (PUCHAR)__readmsr( 0xC0000082 ); // KiSystemCall64 or KiSystemCall64Shadow depending on Win version
 
-    for ( int i = 0; i < 1024; i++ ) {
+    for ( int i = 0; i < 0x2000; i++ ) {
         
-        if ( pStartAddress[i] == 0x4c && pStartAddress[i + 1] == 0x8d && pStartAddress[i + 7] == 0x4c && pStartAddress[i + 8] == 0x8d && pStartAddress[i + 14] == 0xf7 && pStartAddress[i + 15] == 0x43 ) {
-            // 4C 8D 15 E5 8D 3B 00    lea     r10, KeServiceDescriptorTable
-            // 4C 8D 1D DE 0F 3A 00    lea     r11, KeServiceDescriptorTableShadow
-            // F7 43 78 80 00 00 00    test    dword ptr [rbx+78h], 80h
-
-            ssdt = (SSDT*)( pStartAddress + *(int*)&pStartAddress[2] + 7 );
-            KdPrint( ( "=== ssdt: %p\n", ssdt ) );
-            return STATUS_SUCCESS;
+        if ( RtlCompareMemory( &addr[i], "\x66\x66\x66\x66\x66\x66\x66\x0f\x1f\x84\x00\x00", 12 ) == 12 ) {
+            return &addr[i];
         }
 
-    }
-
-
-    return STATUS_UNSUCCESSFUL;
-}
-#endif
-
-PEPROCESS FindProcessWithSessIdZero( VOID )
-{
-    for ( ULONG i = 4; i <= HandleToUlong(PsGetCurrentProcessId()); i += 4 ) {
-        PEPROCESS eProc = nullptr;
-        NTSTATUS ntStatus = PsLookupProcessByProcessId( UlongToHandle( i ), &eProc );
-
-        if ( NT_SUCCESS( ntStatus ) && eProc ) {
-            
-            if ( PsGetProcessSessionIdEx( eProc ) == 0 ) {
-                return eProc;            
-            }
-            ObDereferenceObject( eProc );
-
+        if ( RtlCompareMemory( &addr[i], "\xcc\xcc\xcc\xcc\xcc\xcc\xcc\xcc\xcc\xcc\xcc\xcc", 12 ) == 12 ) {
+            return &addr[i];
         }
-
 
     }
 
@@ -119,48 +87,118 @@ PEPROCESS FindProcessWithSessIdZero( VOID )
 //
 //
 //
-NTSTATUS InstallServiceTable( VOID )
+PKSERVICE_DESCRIPTOR_TABLE getKeServiceDescriptorTable( bool Shadow = false )
 {
-    PEPROCESS eProc = FindProcessWithSessIdZero();
-    if ( eProc == nullptr ) {
-        KdPrint( ( "[-] %s: Failed to find a process with SessionId == 0\n", __FUNCTION__ ) );
+    PKSERVICE_DESCRIPTOR_TABLE result = nullptr;
+
+    PUCHAR pStartAddress = (PUCHAR)__readmsr( 0xC0000082 ); // KiSystemCall64 or KiSystemCall64Shadow depending on Win version
+    KdPrint(( "-- [+] -- KiSystemCall64(Shadow): %p\n", pStartAddress ));
+
+    for ( int i = 0; i < 1024; i++ ) {
+
+        if ( pStartAddress[i] == 0x4c && pStartAddress[i + 1] == 0x8d && pStartAddress[i + 2] == 0x15 &&
+             pStartAddress[i + 7] == 0x4c && pStartAddress[i + 8] == 0x8d && pStartAddress[i + 9] == 0x1d &&
+             pStartAddress[i + 14] == 0xf7 && pStartAddress[i + 15] == 0x43 ) {
+
+            // 4C 8D 15 E5 8D 3B 00    lea     r10, KeServiceDescriptorTable
+            // 4C 8D 1D DE 0F 3A 00    lea     r11, KeServiceDescriptorTableShadow
+            // F7 43 78 80 00 00 00    test    dword ptr [rbx+78h], 80h
+
+            if ( Shadow ) {
+                result = ( PKSERVICE_DESCRIPTOR_TABLE )( &pStartAddress[i + 7] + *(int*)&pStartAddress[i + 7 + 3] + 7 );
+            } else {
+                result = ( PKSERVICE_DESCRIPTOR_TABLE )( &pStartAddress[i] + *(int*)&pStartAddress[i + 3] + 7 );
+            }
+
+            if ( MmIsAddressValid( result ) && MmIsAddressValid( result->ServiceTableBase ) ) {
+                KdPrint(( "-- [+] -- SSDT: %p\n", result ));
+                KdPrint(( "-- [+] -- SST : %p\n", result->ServiceTableBase ));
+                return result;
+            }
+        }
+    
+    }
+
+    return nullptr;
+}
+
+//
+// Check if we can safely overflow Out of Bounds of ssdt->ServiceTableBase
+//
+bool SyscallIsOverMin( USHORT sysnum, PKSERVICE_DESCRIPTOR_TABLE pssdt )
+{
+    KdPrint(( "-- [!] -- sysnum: %#x, count: %#x\n", sysnum, ssdt->NumberOfServices ));
+
+    if ( sysnum < pssdt->NumberOfServices ) {
+        return false;
+    }
+
+    // This verifies that ParamTable is located after the ServiceTableBase
+    //
+    if ( (uintptr_t)pssdt->ParamTableBase - (uintptr_t)&pssdt->ServiceTableBase[pssdt->NumberOfServices] <= 0x20 /* -+ 0x20 */) {
+        
+        uintptr_t min = (uintptr_t)&pssdt->ParamTableBase[pssdt->NumberOfServices] - (uintptr_t)pssdt->ServiceTableBase;
+        min += 0x100;   // Arbitrary value
+        min &= ~0xf;
+        min >>= 2;
+
+        KdPrint(( "-- [!] -- Min syscall number is %#x\n", (USHORT)min ));
+
+        return sysnum >= min;
+
+    } else {
+
+        KdPrint(( "-- [!] -- ParamTableBase was not located following the ServiceTableBase. Need to inspect manually if table can be OOB\n" ));
+    
+    }
+
+
+    return true;
+}
+
+//
+//
+//
+NTSTATUS InstallSyscall( USHORT sysnum, void* func )
+{
+    if ( sysnum > 0xFFF || !MmIsAddressValid( func ) ) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    ssdt = getKeServiceDescriptorTable();
+    trampoline = findTrampoline();
+
+    if ( !ssdt || !trampoline ) {
         return STATUS_UNSUCCESSFUL;
     }
 
-    ServiceTableBase[0] = SSDT_OFFSET( ServiceTableBase, MyCustomSyscall );
-
-    KAPC_STATE ApcState;
-
-    KeStackAttachProcess( eProc, &ApcState );
-    bool ntRet = KeRemoveSystemServiceTable( 2 );
-    KeUnstackDetachProcess( &ApcState );
-    ObDereferenceObject( eProc );
-
-    KdPrint( ( "=== KeAddSystemServiceTable: %#x\n", ntRet ) );
-
-    ntRet = KeAddSystemServiceTable( ServiceTableBase, nullptr, ARRAYSIZE( ServiceTableBase ), ParamTableBase, 2 );
-    KdPrint( ( "=== ServiceTableBase: %p\n", ServiceTableBase ) );
-    KdPrint( ( "=== KeAddSystemServiceTable: %#x\n", ntRet ) );
-    
-    return STATUS_UNSUCCESSFUL;
-}
-
-
-NTSTATUS IrpDeviceIoHandler( PDEVICE_OBJECT DevObj, PIRP Irp )
-{
-    UNREFERENCED_PARAMETER( DevObj );
-
-    PIO_STACK_LOCATION IrpStack = IoGetCurrentIrpStackLocation( Irp );
-
-    Irp->IoStatus.Information = 0;
-
-    if ( IrpStack->Parameters.DeviceIoControl.IoControlCode == IOCTL_INSTALL_CS ) {
-        Irp->IoStatus.Status = InstallServiceTable();        
+    if ( !SyscallIsOverMin( sysnum, ssdt ) ) {
+        return STATUS_INVALID_PARAMETER;
     }
 
-    IoCompleteRequest( Irp, IO_NO_INCREMENT );
+    // Save globals
+    //
+    RtlCopyMemory( origTrampolineBytes, trampoline, 12 );
+    origNumberOfServices = ssdt->NumberOfServices;
+
+    // Install trampoline
+    //
+    trampoline[0] = 0x48;
+    trampoline[1] = 0xb8;
+    *(size_t*)&trampoline[2] = (size_t)func;
+    trampoline[10] = 0xff;
+    trampoline[11] = 0xe0;
+
+    // Inject syscall entry
+    //
+    LONG offset = SSDT_OFFSET( ssdt->ServiceTableBase, trampoline );
+    ssdt->ServiceTableBase[sysnum] = offset;
+    ssdt->NumberOfServices = sysnum + 1;
+
+
     return STATUS_SUCCESS;
 }
+
 
 //
 //
@@ -178,19 +216,17 @@ extern "C" NTSTATUS DriverEntry( PDRIVER_OBJECT DriverObject, PUNICODE_STRING Re
         return ntStatus;
     }
 
+    if ( !NT_SUCCESS( InstallSyscall( 0x321, MyCustomSyscall ) ) ) {
+        IoDeleteDevice( DeviceObject );
+        return STATUS_UNSUCCESSFUL;
+    }
+
     for ( int i = 0; i < IRP_MJ_MAXIMUM_FUNCTION; i++ ) {
         DriverObject->MajorFunction[i] = IrpDefaultHandler;
     }
-    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = IrpDeviceIoHandler;
     DriverObject->DriverUnload = DriverUnload;
 
-    UNICODE_STRING dosDeviceName = RTL_CONSTANT_STRING( DOS_DEVICE_NAME );
-    IoDeleteSymbolicLink( &dosDeviceName );
-    ntStatus = IoCreateSymbolicLink( &dosDeviceName, &ntDeviceName );
-
-    if ( !NT_SUCCESS( ntStatus ) ) {
-        IoDeleteDevice( DeviceObject );
-    }
+    KdPrint(( "-- [+] -- Successful injection.\n" ));
 
     return ntStatus;
 }
