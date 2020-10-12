@@ -1,12 +1,38 @@
 #include <ntifs.h>
 #include <intrin.h>
 #include "shared.h"
+#include "PE.h"
 
 #define SSDT_OFFSET( base, func ) ( (LONG)(((uintptr_t)func - (uintptr_t)base) << 4 ) )
 
-extern NTKERNELAPI PEPROCESS PsInitialSystemProcess;
-
-
+typedef struct _KLDR_DATA_TABLE_ENTRY {
+    LIST_ENTRY InLoadOrderLinks; //0x0
+    VOID* ExceptionTable; //0x10
+    ULONG ExceptionTableSize; //0x18
+    VOID* GpValue; //0x20
+    PNON_PAGED_DEBUG_INFO NonPagedDebugInfo; //0x28
+    VOID* DllBase; //0x30
+    VOID* EntryPoint; //0x38
+    ULONG SizeOfImage; //0x40
+    UNICODE_STRING FullDllName; //0x48
+    UNICODE_STRING BaseDllName; //0x58
+    ULONG Flags; //0x68
+    USHORT LoadCount; //0x6c
+    union {
+        USHORT SignatureLevel : 4; //0x6e
+        USHORT SignatureType : 3; //0x6e
+        USHORT Unused : 9; //0x6e
+        USHORT EntireField; //0x6e
+    } u1; //0x6e
+    VOID* SectionPointer; //0x70
+    ULONG CheckSum; //0x78
+    ULONG CoverageSectionSize; //0x7c
+    VOID* CoverageSection; //0x80
+    VOID* LoadedImports; //0x88
+    VOID* Spare; //0x90
+    ULONG SizeOfImageNotRounded; //0x98
+    ULONG TimeDateStamp; //0x9c
+} KLDR_DATA_TABLE_ENTRY, *PKLDR_DATA_TABLE_ENTRY;
 
 typedef LONG SYSTEM_SERVICE_TABLE, *PSYSTEM_SERVICE_TABLE;
 typedef struct _KSERVICE_DESCRIPTOR_TABLE {
@@ -15,6 +41,9 @@ typedef struct _KSERVICE_DESCRIPTOR_TABLE {
     ULONG NumberOfServices;                             // number of services in SSDT
     PUCHAR ParamTableBase;                              // table for number of bytes arguments take on the stack -- TODO
 } KSERVICE_DESCRIPTOR_TABLE, *PKSERVICE_DESCRIPTOR_TABLE;
+
+
+EXTERN_C NTKERNELAPI LIST_ENTRY PsLoadedModuleList;
 
 
 //
@@ -91,10 +120,18 @@ PKSERVICE_DESCRIPTOR_TABLE getKeServiceDescriptorTable( bool Shadow = false )
 {
     PKSERVICE_DESCRIPTOR_TABLE result = nullptr;
 
-    PUCHAR pStartAddress = (PUCHAR)__readmsr( 0xC0000082 ); // KiSystemCall64 or KiSystemCall64Shadow depending on Win version
-    KdPrint(( "-- [+] -- KiSystemCall64(Shadow): %p\n", pStartAddress ));
+    PEHeader nt( ((PKLDR_DATA_TABLE_ENTRY)PsLoadedModuleList.Flink)->DllBase );
 
-    for ( int i = 0; i < 1024; i++ ) {
+    PIMAGE_SECTION_HEADER shdr = nt.section_hdr( ".text" );
+    if ( shdr == nullptr ) {
+        KdPrint( ( "-- [-] -- .text section NOT FOUND\n" ) );
+        return nullptr;
+    }
+
+    PUCHAR pStartAddress = (PUCHAR)nt.rva2va( shdr->VirtualAddress );
+    KdPrint(( "-- [!] -- Searching %p for SSDT in %#x bytes.\n", pStartAddress, shdr->Misc.VirtualSize ));
+
+    for ( ULONG i = 0; i < shdr->Misc.VirtualSize; i++ ) {
 
         if ( pStartAddress[i] == 0x4c && pStartAddress[i + 1] == 0x8d && pStartAddress[i + 2] == 0x15 &&
              pStartAddress[i + 7] == 0x4c && pStartAddress[i + 8] == 0x8d && pStartAddress[i + 9] == 0x1d &&
@@ -203,7 +240,7 @@ NTSTATUS InstallSyscall( USHORT sysnum, void* func )
 //
 //
 //
-extern "C" NTSTATUS DriverEntry( PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath )
+EXTERN_C NTSTATUS DriverEntry( PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath )
 {
     UNREFERENCED_PARAMETER( RegistryPath );
 

@@ -32,5 +32,8 @@
     <ClInclude Include="shared.h">
       <Filter>Source Files</Filter>
     </ClInclude>
+    <ClInclude Include="PE.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>
