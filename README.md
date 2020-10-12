@@ -60,3 +60,8 @@ The low-order nibble is used to hold the number of arguments passed thru the sta
 ![demo1](/assets/custom_syscall.gif)
 
 ![demo2](/assets/custom_syscall1.gif)
+
+# References
+* https://www.ired.team/miscellaneous-reversing-forensics/windows-kernel-internals/glimpse-into-ssdt-in-windows-x64-kernel
+* https://www.atelierweb.com/the-quest-for-the-ssdts/
+* https://scorpiosoftware.net/2019/11/13/where-did-system-service-0-and-1-go/
